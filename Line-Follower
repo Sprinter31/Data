@@ -1,0 +1,46 @@
+from pybricks.hubs import InventorHub
+from pybricks.pupdevices import Motor, ColorSensor
+from pybricks.parameters import Port, Direction, Stop
+from pybricks.robotics import DriveBase
+from pybricks.tools import wait
+
+hub = InventorHub()
+
+# ---- Ports anpassen ----
+left_motor  = Motor(Port.A, Direction.COUNTERCLOCKWISE)
+right_motor = Motor(Port.B, Direction.CLOCKWISE)
+
+cs_left  = ColorSensor(Port.C)
+cs_right = ColorSensor(Port.D)
+
+# ---- DriveBase anpassen ----
+WHEEL_DIAMETER_MM = 56
+AXLE_TRACK_MM     = 115
+drive = DriveBase(left_motor, right_motor, WHEEL_DIAMETER_MM, AXLE_TRACK_MM)
+
+# ---- Kalibrierwerte ----
+# Lies mal cs_left.reflection() / cs_right.reflection() auf WEISS und auf SCHWARZ
+# Dann setz LINE_TH ungefähr in die Mitte.
+LINE_TH = 25
+
+# P-Regler: je größer, desto aggressiver lenkt er
+P_GAIN = 2.2
+
+SPEED = 140  # mm/s
+
+def main():
+    while True:
+        left = cs_left.reflection()
+        right = cs_right.reflection()
+
+        # Fehler: positiv => links heller als rechts => Linie eher rechts -> nach rechts drehen
+        error = left - right
+
+        turn_rate = P_GAIN * error  # deg/s (DriveBase erwartet deg/s)
+
+        drive.drive(SPEED, turn_rate)
+
+        wait(10)
+
+main()
+#LINE_TH und P_GAIN kalibrieren
