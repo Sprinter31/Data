@@ -1,0 +1,406 @@
+# Pybricks MicroPython (SPIKE Prime / Robot Inventor)
+from pybricks.hubs import InventorHub
+from pybricks.pupdevices import Motor, ColorSensor
+from pybricks.parameters import Port, Direction, Stop, Color
+from pybricks.robotics import DriveBase
+from pybricks.tools import wait
+
+# ----------------------------
+# Hardware setup (ANPASSEN!)
+# ----------------------------
+hub = InventorHub()
+
+left_motor  = Motor(Port.A, Direction.COUNTERCLOCKWISE)
+right_motor = Motor(Port.B, Direction.CLOCKWISE)
+
+# 2 Farbsensoren: links/rechts neben der Linie
+cs_left  = ColorSensor(Port.C)
+cs_right = ColorSensor(Port.D)
+
+# DriveBase: wheel_diameter und axle_track MÜSSEN stimmen
+WHEEL_DIAMETER_MM = 56
+AXLE_TRACK_MM     = 115
+drive = DriveBase(left_motor, right_motor, WHEEL_DIAMETER_MM, AXLE_TRACK_MM)
+
+# ----------------------------
+# Strecke / Sensor Parameter
+# ----------------------------
+# Reflektion-Schwellen: weiß > schwarz. Kalibrieren!
+# Tipp: print(cs_left.reflection(), cs_right.reflection()) auf weiß/schwarz
+REFLECT_LINE_TH = 25     # unterhalb = "schwarz / Linie"
+REFLECT_WHITE_TH = 40    # oberhalb = "weiß"
+
+# Line-Following
+FOLLOW_SPEED = 120       # mm/s
+TURN_RATE    = 0         # wird im line follower per P-Regler gesetzt
+P_GAIN       = 2.2       # muss angepasst werden
+
+# Kreuzungserkennung: beide Sensoren sehen Linie (= viel schwarz)
+# In der Praxis: "beide unter REFLECT_LINE_TH" ist ein guter Start
+INTERSECTION_CONFIRM_MS = 120
+
+# Marker-Streifen (Farbcode) Abstände – an euer Tape anpassen
+STRIPE_STEP_MM = 25      # wie weit du zwischen den 3 Farbstreifen weiterfährst
+STRIPE_SAMPLES = 6       # wie oft pro Streifen sampeln
+
+# Scannen von Abzweigen
+SCAN_TURN_RATE = 80      # deg/s
+SCAN_CHECK_DISTANCE_MM = 20  # mini vor/zurück zum Check
+
+# ----------------------------
+# Directions (absolute)
+# ----------------------------
+N, E, S, W = 0, 1, 2, 3
+
+def turn_left_dir(d):   return (d + 3) % 4
+def turn_right_dir(d):  return (d + 1) % 4
+def back_dir(d):        return (d + 2) % 4
+
+# ----------------------------
+# Marker (Color -> digit)
+# ----------------------------
+COLOR_DIGIT = {
+    Color.RED:    0,
+    Color.GREEN:  1,
+    Color.BLUE:   2,
+    Color.YELLOW: 3
+}
+
+def read_color_stable():
+    """
+    Liest 'stabil' eine Farbe (Mehrheitsentscheidung).
+    Achtung: Farberkennung ist je nach Licht/Material tricky.
+    """
+    counts = {}
+    for _ in range(STRIPE_SAMPLES):
+        c1 = cs_left.color()
+        c2 = cs_right.color()
+        # wenn beide Sensoren nicht gleich: nimm die häufigere / oder linke
+        c = c1 if c1 == c2 else c1
+        counts[c] = counts.get(c, 0) + 1
+        wait(10)
+
+    # best color
+    best = None
+    bestn = -1
+    for c, n in counts.items():
+        if n > bestn:
+            best, bestn = c, n
+    return best
+
+def read_marker_id():
+    """
+    Erwartet 3 Farbstreifen hintereinander.
+    Gibt eindeutige int-ID zurück (0..63) mit Base-4 Codierung.
+    """
+    digits = []
+    for i in range(3):
+        c = read_color_stable()
+        if c not in COLOR_DIGIT:
+            # falls Farbe nicht erkannt: fail-safe
+            # du kannst hier auch nochmal kurz vor/zurück fahren und erneut lesen
+            raise RuntimeError("Marker-Farbe nicht erkannt: {}".format(c))
+        digits.append(COLOR_DIGIT[c])
+
+        if i < 2:
+            drive.straight(STRIPE_STEP_MM)
+
+    # base-4 to int: d0 d1 d2
+    return digits[0] * 16 + digits[1] * 4 + digits[2]
+
+# ----------------------------
+# Line / intersection helpers
+# ----------------------------
+def on_line():
+    return (cs_left.reflection() < REFLECT_LINE_TH) or (cs_right.reflection() < REFLECT_LINE_TH)
+
+def intersection_detected():
+    # beide Sensoren "schwarz" -> typischer Kreuzungsbereich
+    return (cs_left.reflection() < REFLECT_LINE_TH) and (cs_right.reflection() < REFLECT_LINE_TH)
+
+def follow_line_until_intersection():
+    """
+    Einfacher P-Regler Line-Follower bis Kreuzung.
+    Gibt gefahrene Strecke (mm) zurück.
+    """
+    drive.reset()
+    confirmed_ms = 0
+
+    while True:
+        # error: links - rechts
+        err = cs_left.reflection() - cs_right.reflection()
+        turn = P_GAIN * err
+
+        drive.drive(FOLLOW_SPEED, turn)
+
+        if intersection_detected():
+            confirmed_ms += 10
+            if confirmed_ms >= INTERSECTION_CONFIRM_MS:
+                drive.stop(Stop.BRAKE)
+                dist = drive.distance()
+                return dist
+        else:
+            confirmed_ms = 0
+
+        wait(10)
+
+def detect_line_ahead_brief():
+    """
+    Checkt, ob in Fahrtrichtung eine Linie ist.
+    Idee: ein Stück vor, messen, wieder zurück.
+    """
+    drive.straight(SCAN_CHECK_DISTANCE_MM)
+    has = on_line()
+    drive.straight(-SCAN_CHECK_DISTANCE_MM)
+    return has
+
+def rotate_to_heading(current_heading, target_heading):
+    """
+    Dreht den Roboter zur gewünschten absoluten Richtung.
+    Wir nehmen an: 90° Turns, heading als N/E/S/W.
+    """
+    diff = (target_heading - current_heading) % 4
+    if diff == 0:
+        return current_heading
+    elif diff == 1:
+        drive.turn(90)
+        return target_heading
+    elif diff == 2:
+        drive.turn(180)
+        return target_heading
+    elif diff == 3:
+        drive.turn(-90)
+        return target_heading
+
+def scan_exits(current_heading):
+    """
+    An einer Kreuzung: prüft welche ABSOLUTEN Ausgänge existieren.
+    Liefert Liste von headings (z.B. [N, E, W]).
+    """
+    exits = []
+
+    # wir stehen im Kreuzungszentrum, schauen in current_heading
+    # Check STRAIGHT
+    if detect_line_ahead_brief():
+        exits.append(current_heading)
+
+    # Check LEFT
+    drive.turn(-90)
+    h_left = turn_left_dir(current_heading)
+    if detect_line_ahead_brief():
+        exits.append(h_left)
+    drive.turn(90)
+
+    # Check RIGHT
+    drive.turn(90)
+    h_right = turn_right_dir(current_heading)
+    if detect_line_ahead_brief():
+        exits.append(h_right)
+    drive.turn(-90)
+
+    # BACK ist immer möglich (woher du kamst) – aber nur sinnvoll, wenn du nicht am Start bist.
+    # Wir fügen BACK NICHT automatisch hinzu, weil es am Start sonst falsche Kanten erzeugt.
+    return exits
+
+# ----------------------------
+# Graph data structures
+# ----------------------------
+class GraphMap:
+    def __init__(self):
+        # node_id -> {"code": int, "edges": {abs_dir: (neighbor_id, dist_mm)}}
+        self.nodes = {}
+        # code -> node_id
+        self.code_to_node = {}
+        self.next_node_id = 0
+
+    def get_or_create(self, code):
+        if code in self.code_to_node:
+            return self.code_to_node[code], False
+        nid = self.next_node_id
+        self.next_node_id += 1
+        self.code_to_node[code] = nid
+        self.nodes[nid] = {"code": code, "edges": {}}
+        return nid, True
+
+    def add_edge(self, a, dir_from_a, b, dist_mm):
+        # gerichtete Kante (a -> b) in Richtung dir_from_a
+        self.nodes[a]["edges"][dir_from_a] = (b, dist_mm)
+
+    def has_edge(self, a, dir_from_a):
+        return dir_from_a in self.nodes[a]["edges"]
+
+# ----------------------------
+# Dijkstra shortest path
+# ----------------------------
+def dijkstra(graph, start, goal):
+    INF = 10**18
+    dist = {nid: INF for nid in graph.nodes}
+    prev = {nid: None for nid in graph.nodes}  # (prev_node, prev_dir)
+    dist[start] = 0
+    unvisited = set(graph.nodes.keys())
+
+    while unvisited:
+        # node with smallest dist
+        cur = None
+        curd = INF
+        for n in unvisited:
+            if dist[n] < curd:
+                cur, curd = n, dist[n]
+        if cur is None:
+            break
+        if cur == goal:
+            break
+
+        unvisited.remove(cur)
+
+        for d, (nb, w) in graph.nodes[cur]["edges"].items():
+            if nb not in unvisited and nb != goal:
+                # trotzdem ok, aber wir lassen es simpel
+                pass
+            nd = dist[cur] + w
+            if nd < dist.get(nb, INF):
+                dist[nb] = nd
+                prev[nb] = (cur, d)
+
+    if dist.get(goal, INF) >= INF:
+        return None  # kein Pfad
+
+    # reconstruct (node list + dirs)
+    path_nodes = [goal]
+    path_dirs = []
+    cur = goal
+    while cur != start:
+        p = prev[cur]
+        if p is None:
+            return None
+        pn, pd = p
+        path_dirs.append(pd)
+        path_nodes.append(pn)
+        cur = pn
+    path_nodes.reverse()
+    path_dirs.reverse()
+    return path_nodes, path_dirs
+
+# ----------------------------
+# Exploration (DFS)
+# ----------------------------
+def explore_full_network():
+    """
+    Erkundet das komplette Netz und baut den Graphen.
+    Annahme: Start steht auf einer Kreuzung und schaut nach "N" (heading=N).
+    """
+    graph = GraphMap()
+
+    heading = N  # start heading definieren
+    # Stelle sicher, dass du wirklich auf/bei Marker bist:
+    start_code = read_marker_id()
+    current, _ = graph.get_or_create(start_code)
+
+    # Backtracking stack: (from_node, from_heading, to_node, used_dir, dist)
+    stack = []
+
+    while True:
+        # scanne Ausgänge an aktueller Kreuzung
+        exits = scan_exits(heading)
+
+        # wähle unversuchten Ausgang
+        chosen = None
+        for d in exits:
+            if not graph.has_edge(current, d):
+                chosen = d
+                break
+
+        if chosen is None:
+            # keine neuen Ausgänge -> backtrack
+            if not stack:
+                # fertig
+                return graph, current, heading
+            prev_node, prev_heading, child_node, used_dir, dist_mm = stack.pop()
+
+            # wir sind an child_node und wollen zurück zu prev_node
+            # drehe zur Rückrichtung (back of used_dir)
+            target_dir = back_dir(used_dir)
+            heading = rotate_to_heading(heading, target_dir)
+
+            # zurückfahren: wir nutzen line-follower bis intersection, nicht dist_mm "blind"
+            _ = follow_line_until_intersection()
+
+            # jetzt sind wir wieder an prev_node; lies marker zur Sicherheit
+            code = read_marker_id()
+            current = graph.code_to_node.get(code, prev_node)
+            heading = rotate_to_heading(heading, prev_heading)
+            continue
+
+        # gehe in chosen Richtung
+        heading = rotate_to_heading(heading, chosen)
+
+        # fahre zur nächsten Kreuzung
+        dist_mm = follow_line_until_intersection()
+
+        # nach der Kreuzung den Marker-Code lesen
+        code = read_marker_id()
+        nxt, _ = graph.get_or_create(code)
+
+        # edge eintragen (hin und zurück)
+        graph.add_edge(current, chosen, nxt, dist_mm)
+        graph.add_edge(nxt, back_dir(chosen), current, dist_mm)
+
+        # push für backtracking
+        stack.append((current, heading, nxt, chosen, dist_mm))
+
+        # update current
+        current = nxt
+        # heading bleibt in Fahrtrichtung "chosen"
+
+# ----------------------------
+# Execute path (drive fastest route)
+# ----------------------------
+def drive_path(graph, start_node, start_heading, goal_code):
+    if goal_code not in graph.code_to_node:
+        raise RuntimeError("Ziel-ID nicht in Map: {}".format(goal_code))
+    goal = graph.code_to_node[goal_code]
+
+    res = dijkstra(graph, start_node, goal)
+    if res is None:
+        raise RuntimeError("Kein Pfad zum Ziel gefunden.")
+    path_nodes, path_dirs = res
+
+    heading = start_heading
+    current = start_node
+
+    # Folge den dirs
+    for d in path_dirs:
+        heading = rotate_to_heading(heading, d)
+        _ = follow_line_until_intersection()
+        code = read_marker_id()
+        current = graph.code_to_node[code]
+        # heading bleibt wie d
+
+    return current, heading
+
+# ----------------------------
+# MAIN
+# ----------------------------
+def main():
+    # 1) komplettes Netz erkunden
+    graph, end_node, end_heading = explore_full_network()
+
+    # Jetzt stehen wir irgendwo. Für "Abfahren" ist es oft praktisch,
+    # wieder zum Start zu fahren. Startcode ist der Marker, den du als erstes gelesen hast.
+    # Einfach: nimm irgendein Ziel:
+    # Beispiel: Zielkreuzung Code = 5 (musst du auf Strecke so definieren)
+    TARGET_CODE = 5
+
+    # Wir nehmen als Start fürs Routing die aktuelle Position (end_node)
+    drive_path(graph, end_node, end_heading, TARGET_CODE)
+
+    # fertig
+    drive.stop()
+
+main()
+
+#KALIBRIEREN
+#REFLECT_LINE_TH: auf Linie/Untergrund anpassen
+#P_GAIN: Line-Following stabil machen
+#STRIPE_STEP_MM: passt der Abstand zwischen den 3 Farbstreifen?
+#read_color_stable(): klappt Farberkennung bei deinem Licht? (sonst: Streifen breiter, langsam drüber)
