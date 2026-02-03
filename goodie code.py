@@ -28,7 +28,6 @@ def right_of(d): return (d + 1) % 4
 def back_of(d): return (d + 2) % 4
 
 
-# color codes
 color_codes = [Color.RED, Color.GREEN, Color.YELLOW]
 
 SPEED = 100
@@ -37,25 +36,25 @@ P_GAIN = SPEED / 33
 intersections = []
 
 driven_intersections = []
+driven_intersections_new = []
 
 
 class Intersection:
     def __init__(self, cur_id, direction):
         self.id = cur_id
-        self.befahreneRichtung = []
-        self.last_came_in_dir = direction
+        self.befahreneRichtungen = []
+        self.came_from = direction
 
 
-def get_or_create_intersection(cur_id):
+def get_or_create_intersection(cur_id, came_from):
     for intersection in intersections:
         if intersection.id == cur_id:
+            intersection.came_from = came_from
             return intersection
 
     current_dir = get_cur_dir()
-    intersection = Intersection(cur_id, current_dir)
-
-    intersection.befahreneRichtung.append(back_of(current_dir))
-
+    intersection = Intersection(cur_id, came_from)
+    intersection.befahreneRichtungen.append(back_of(current_dir))
     intersections.append(intersection)
     return intersection
 
@@ -70,7 +69,7 @@ def get_next_intersection_dir(intersection):
     ]
 
     for direction in prio:
-        if direction not in intersection.befahreneRichtung:
+        if direction not in intersection.befahreneRichtungen:
             return direction
 
     return None
@@ -122,10 +121,19 @@ def fully_explored():
     return True
 
 
+def find_intersection(cur_id):
+    for it in intersections:
+        if it.id == cur_id:
+            return it
+    return None
+
+
 def scan_intersection_id():
     intersection_id = 0
     for i in range(3):
         try:
+            drive.stop()
+            wait(50)
             intersection_id += color_codes.index(cl.color()) * 3 ** (2 - i)
             drive.straight(stripe_width)
         except ValueError:
@@ -134,44 +142,59 @@ def scan_intersection_id():
     return intersection_id
 
 
+def get_current_intersection():
+    came_from = back_of(get_cur_dir())
+    current_intersection_id = scan_intersection_id()
+    if current_intersection_id is None:
+        return None
+    current_intersection = get_or_create_intersection(current_intersection_id, came_from)
+    return current_intersection
+
+
 def is_on_intersection():
     color = cl.color()
     return color == Color.GREEN or color == Color.YELLOW or color == Color.RED
 
 
 def drive_to_last_drivable_intersection():
-    for i in range(len(driven_intersections) - 1, -1, -1):
-        cur_intersection = driven_intersections[i]
-        turn_to_dir(back_of(cur_intersection.last_came_in_dir))
-        drive_to_next_intersection()
+    global driven_intersections
+    global driven_intersections_new
 
-        if get_next_intersection_dir(cur_intersection) is not None:
+    for i in range(len(driven_intersections) - 1, -1, -1):
+        last_intersection = driven_intersections[i]
+        turn_to_dir(last_intersection.came_from)
+        drive_to_next_intersection()
+        new_intersection = get_current_intersection()
+        driven_intersections_new.append(new_intersection)
+
+        if get_next_intersection_dir(new_intersection) is not None:
+            driven_intersections = driven_intersections_new[:]
+            driven_intersections_new.clear()
             break
 
         leave_intersection()
 
 
 def main():
+    gyro.reset_angle(0)
     while True:
         if is_on_intersection():
-            current_intersection_id = scan_intersection_id()
+            current_intersection = get_current_intersection()
 
-            if current_intersection_id is None:
+            if current_intersection is None:
                 continue
 
-            current_intersection = get_or_create_intersection(current_intersection_id)
-            intersection.last_came_in_dir = back_of(get_cur_dir())
             driven_intersections.append(current_intersection)
 
-            if any(i.id == current_intersection.id for i in intersections):  # known intersection
-                if not get_next_intersection_dir(intersection) is None:  # if direction found
-                    next_dir = get_next_intersection_dir(intersection)
-                    turn_to_dir(next_dir)
-                    current_intersection.befahreneRichtung.append(next_dir)
-                elif (get_next_intersection_dir(intersection) is None) and (not fully_explored()):  # intersections can be driven
-                    drive_to_last_drivable_intersection()  # drive to intersection that can be driven
-                else:  # fully explored
-                    break
+            if not get_next_intersection_dir(current_intersection) is None:  # if direction found
+                next_dir = get_next_intersection_dir(current_intersection)
+                turn_to_dir(next_dir)
+                current_intersection.befahreneRichtungen.append(next_dir)
+                leave_intersection()
+            elif (get_next_intersection_dir(current_intersection) is None) and (not fully_explored()):  # intersections can be driven
+                drive_to_last_drivable_intersection()  # drive to intersection that can be driven
+            else:  # fully explored
+                break
 
         else:
             follow_line()
