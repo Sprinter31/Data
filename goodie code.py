@@ -41,7 +41,7 @@ driven_intersections = []
 driven_intersections_new = []
 
 last_intersection = None
-last_came_from = None
+last_dir_exited = None
 
 # came from is the direction the bot came from when entering the intersection
 class Intersection:
@@ -101,6 +101,34 @@ def turn_to_dir(direction):
     delta = (angle_target - gyro.angle() + 180) % 360 - 180
     drive.turn(delta)
 
+    wait(50)
+    snap_gyro_to_grid()
+
+
+#def align_to_line(max_ms=1500):
+#    sw = StopWatch()
+#    while sw.time() < max_ms:
+#        left = cs_left.reflection()
+#        right = cs_right.reflection()
+#        err = left - right
+#
+#        if abs(err) < 2:
+#            drive.stop()
+#            wait(50)
+#            return True
+#
+#        drive.drive(0, 6 * err)
+#        wait(10)
+#
+#    drive.stop()
+#    return False
+
+# test ts
+def snap_gyro_to_grid():
+    a = gyro.angle()
+    snapped = int(round(a / 90.0)) * 90
+    gyro.reset_angle(snapped)
+
 
 def follow_line():
     left = cs_left.reflection()
@@ -139,6 +167,14 @@ def edge_exists(intersection, direction):
     return False
 
 
+def drive_with_line_following(distance_mm):
+    start = drive.distance()
+    while drive.distance() - start < distance_mm:
+        follow_line()
+    drive.stop()
+    wait(50)
+
+
 def find_intersection(cur_id):
     for it in intersections:
         if it.id == cur_id:
@@ -149,58 +185,80 @@ def find_intersection(cur_id):
 def scan_intersection_id():
     intersection_id = 0
     for i in range(3):
-        try:
-            drive.stop()
-            wait(500)
-            intersection_id += color_codes.index(cl.color()) * 3 ** (2 - i)
-            drive.straight(stripe_width)
-        except ValueError:
+        drive.stop()
+        wait(250)
+
+        c = cl.color()
+        if c not in color_codes:
             return None
 
-    print(intersection_id)
+        intersection_id += color_codes.index(c) * 3 ** (2 - i)
+        drive_with_line_following(stripe_width)
+
     return intersection_id
 
 
 def get_current_intersection():
-    came_from = get_cur_dir()
     current_intersection_id = scan_intersection_id()
     if current_intersection_id is None:
-        return None, None
+        return None
     ev3.speaker.say(str(current_intersection_id))
     current_intersection = get_or_create_intersection(current_intersection_id)
-    return current_intersection, came_from
+    return current_intersection
 
 
 def is_on_intersection():
     color = cl.color()
     return color == Color.YELLOW or color == Color.RED
 
-def drive_to_last_drivable_intersection():
+
+def drive_to_last_drivable_intersection(current_intersection):
     for i in range(len(driven_intersections) - 1, -1, -1):
-        intersection = driven_intersection[i]
-        if get_next_intersection_dir(intersection) is not None:
-            drive_to_intersection(intersection)
+        target_intersection = driven_intersections[i]
+        if get_next_intersection_dir(target_intersection) is not None:
+            drive_to_intersection(current_intersection, target_intersection)
             break
+
 
 def get_path(cur_intersection, target_intersection):
     return None
 
+
 def drive_to_intersection(cur_intersection, target_intersection):
-    path = get_path(cur_intersection, target_intersection) # should contain the current intersection
-    for i, intersection in enumerate(path):
-        if i == len(path) - 1: 
-            break
-        for edge in intersection.edges:
-            if edge.next_intersection == path[i + 1]:
+    path = get_path(cur_intersection, target_intersection)  # should contain the current intersection
+    if path is None:
+        ev3.speaker.say('no path')
+        return
+
+    current = cur_intersection
+
+    for i in range(len(path) - 1):
+        it_a = path[i]
+        it_b = path[i + 1]
+
+        next_dir = None
+        for edge in it_a.edges:
+            if edge.next_intersection == it_b:
                 next_dir = edge.direction
-    
-    turn_to_dir(next_dir)
-    drive_to_next_intersection()
-    current_intersection = get_current_intersection()
+                break
+
+        if next_dir is None:
+            ev3.speaker.say('missing edge')
+            return
+
+        turn_to_dir(next_dir)
+        leave_intersection()
+        drive_to_next_intersection()
+        current = get_current_intersection()
+
+        if current is None or current.id != it_b.id:
+            ev3.speaker.say('wrong intersection')
+            return
 
 
 def main():
     global last_intersection
+    global last_dir_exited
     gyro.reset_angle(0)
     drive.reset()
     wait(500)
@@ -208,7 +266,7 @@ def main():
     while True:
         if is_on_intersection():
             print(cl.color())
-            current_intersection, came_from = get_current_intersection()
+            current_intersection = get_current_intersection()
 
             if current_intersection is None: # means scanning failed
                 continue
@@ -217,22 +275,19 @@ def main():
             
             # add edges
             if last_intersection is not None:
-                dir_from_last_to_current = back_of(came_from)
                 print('current dir: ', get_cur_dir())
-                if not edge_exists(last_intersection, dir_from_last_to_current):
-                    last_intersection.edges.append(
-                    Edge(current_intersection, last_came_from), driven_distance)) # here ts
+                if not edge_exists(last_intersection, last_dir_exited):
+                    last_intersection.edges.append(Edge(current_intersection, last_dir_exited, driven_distance))
                     print('last intersection: ', last_intersection.id)
                     for edge in last_intersection.edges:
                         print(' ')
                         print('next intersection:', edge.next_intersection.id,
-                        'dir:', edge.direction,
-                        'length:', edge.length)
+                        'dir: ', edge.direction,
+                        'length: ', edge.length)
                 
 
-                if not edge_exists(current_intersection, came_from):
-                    current_intersection.edges.append(
-                    Edge(last_intersection, back_of(came_from), driven_distance))
+                if not edge_exists(current_intersection, back_of(get_cur_dir())):
+                    current_intersection.edges.append(Edge(last_intersection, back_of(get_cur_dir()), driven_distance))
                     print('cur intersection: ', current_intersection.id)
                     for edge in current_intersection.edges:
                         print(' ')
@@ -242,16 +297,13 @@ def main():
                 
 
             last_intersection = current_intersection
-            last_came_from = came_from
             driven_intersections.append(current_intersection)
-
-
-
-            drive.reset()
 
             next_dir = get_next_intersection_dir(current_intersection)
 
             if next_dir is not None:
+                last_dir_exited = next_dir
+
                 drive.straight(30)
                 turn_to_dir(next_dir)
                 leave_intersection()
@@ -260,7 +312,7 @@ def main():
                 continue
                 
             elif (get_next_intersection_dir(current_intersection) is None) and (not fully_explored()):  # intersections can be driven
-                drive_to_last_drivable_intersection()  # drive to intersection that can be driven
+                drive_to_last_drivable_intersection(current_intersection)  # drive to intersection that can be driven
             else:  # fully explored
                 break
 
